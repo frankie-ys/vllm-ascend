@@ -2131,13 +2131,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
         per_layer_attn_metadata: dict[str, Any] = {}
+        # One DSA cache dict shared by all attn groups within this decode step.
+        # DSpark draft layers span multiple kv-cache groups; every group gets
+        # its own build_for_drafting call but most of the drafted metadata
+        # (RoPE tables, local token metadata, SAS metadata, ...) only depends
+        # on group-invariant fields of common_attn_metadata, so it is computed
+        # by the first group and reused by the remaining ones.
+        shared_dsa_draft_cache: dict = {}
         for attn_group in self.draft_attn_groups:
             builder = attn_group.get_metadata_builder()
             extra_attn_metadata_args: dict = {}
-            if self.use_compress:
-                extra_attn_metadata_args = dict(
-                    common_ratio_to_sas_metadata=dict(),
-                )
             if self.method == "dspark":
                 gid = attn_group.kv_cache_group_id
                 common_attn_metadata = copy.copy(common_attn_metadata)
@@ -2147,10 +2150,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 slot_mapping = self._per_group_query_slot_mapping_buffers[gid]
                 if slot_mapping is not None:
                     common_attn_metadata.slot_mapping = slot_mapping[:num_input_tokens]
+                extra_attn_metadata_args = dict(
+                    common_ratio_to_sas_metadata=shared_dsa_draft_cache,
+                )
                 attn_metadata = builder.build_for_drafting(
                     common_attn_metadata, draft_index=1, **extra_attn_metadata_args
                 )
             else:
+                if self.use_compress:
+                    extra_attn_metadata_args = dict(
+                        common_ratio_to_sas_metadata=dict(),
+                    )
                 attn_metadata = builder.build(
                     0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args
                 )
