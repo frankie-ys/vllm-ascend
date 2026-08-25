@@ -2157,10 +2157,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     common_attn_metadata, draft_index=1, **extra_attn_metadata_args
                 )
             else:
-                if self.use_compress:
-                    extra_attn_metadata_args = dict(
-                        common_ratio_to_sas_metadata=dict(),
-                    )
+                # Share the same DSA cache dict across attn groups as well.
+                # build() asserts a non-None common_ratio_to_sas_metadata and
+                # the model runner already shares one dict across cache groups
+                # in regular execution, so this is both required and consistent.
+                extra_attn_metadata_args = dict(
+                    common_ratio_to_sas_metadata=shared_dsa_draft_cache,
+                )
                 attn_metadata = builder.build(
                     0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args
                 )

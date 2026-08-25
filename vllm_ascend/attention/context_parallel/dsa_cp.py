@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pcp_group, get_tp_group
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionImplBase, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -410,6 +411,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         )
 
         if metadata_cache is not None and "num_decodes" in metadata_cache:
+            logger.debug("[dsa_cp] Cross-group drafting metadata cache hit for draft step %d.", draft_index)
             num_decodes = metadata_cache["num_decodes"]
             num_prefills = metadata_cache["num_prefills"]
             num_decode_tokens = metadata_cache["num_decode_tokens"]
@@ -445,8 +447,14 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
         elif common_attn_metadata.seq_lens_cpu is not None:
             self.seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        elif metadata_cache is not None and "seq_lens_cpu" in metadata_cache:
+            # Reuse the device->host copy built by a sibling kv-cache group
+            # instead of synchronizing again.
+            self.seq_lens_cpu = metadata_cache["seq_lens_cpu"]
         else:
             self.seq_lens_cpu = self.seq_lens.cpu()
+            if metadata_cache is not None:
+                metadata_cache["seq_lens_cpu"] = self.seq_lens_cpu
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
 
