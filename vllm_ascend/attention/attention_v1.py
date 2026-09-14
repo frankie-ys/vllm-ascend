@@ -187,6 +187,13 @@ class AscendMetadata:
     seq_lens: torch.Tensor = None
     seq_lens_cpu: torch.Tensor = None
     seq_lens_list: list[int] = None  # type: ignore
+    # Exact per-request KV lengths on device. Derived from the GPU-side
+    # corrected num_computed_tokens (update_num_computed_tokens_for_batch_change),
+    # so unlike seq_lens / seq_lens_list — which only carry the optimistic
+    # upper bound in async spec decode (all drafts assumed accepted) — this is
+    # authoritative for FIA's actual_seq_kvlen no matter how many draft tokens
+    # were rejected.
+    seq_lens_gpu: torch.Tensor = None
     actual_seq_lengths_q: list[int] = None  # type: ignore
 
     query_start_loc: torch.Tensor = None
@@ -372,6 +379,15 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             padding_len = num_reqs_fia - len(seq_lens_list)
             seq_lens_list = seq_lens_list + [1] * padding_len
             seq_lens = torch.cat([seq_lens, seq_lens.new_ones(padding_len)])
+        # Exact KV lengths on device (see AscendAttentionMetadata.seq_lens_gpu):
+        # common_attn_metadata.seq_lens carries the GPU-corrected
+        # num_computed_tokens + scheduled tokens. Pad to match the FIA batch
+        # size exactly like the CPU mirrors above (dummy request -> KV length 1).
+        seq_lens_gpu = common_attn_metadata.seq_lens[:num_reqs]
+        if seq_lens_gpu.shape[0] < num_reqs_fia:
+            seq_lens_gpu = torch.cat(
+                [seq_lens_gpu, seq_lens_gpu.new_ones(num_reqs_fia - seq_lens_gpu.shape[0])]
+            )
         if block_table is not None and block_table.shape[0] < num_reqs_fia:
             block_table = torch.cat(
                 [
@@ -397,6 +413,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens_list,
+            seq_lens_gpu=seq_lens_gpu,
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=actual_seq_lengths_q,
             slot_mapping=slot_mapping,
@@ -686,12 +703,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
                     if _EXTRA_CTX.is_draft_model:
                         draft_step, key = draft_attn_key_steps[attn_count]
-                        seq_lens = attn_metadata[draft_step][key].seq_lens_list
+                        # GPU-side corrected KV lengths: exact even in async spec
+                        # decode, where the CPU mirrors carry only the optimistic
+                        # upper bound. The tensor aliases the model runner's
+                        # persistent seq_lens buffer (stable device pointer, content
+                        # updated on-stream each step).
+                        seq_lens = attn_metadata[draft_step][key].seq_lens_gpu
                         actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
                         attn_count = attn_count + 1
                     else:
                         metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
-                        seq_lens = attn_metadata[metadata_key].seq_lens_list
+                        seq_lens = attn_metadata[metadata_key].seq_lens_gpu
                         actual_seq_lengths_q = attn_metadata[metadata_key].actual_seq_lengths_q
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
@@ -863,7 +885,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     if _EXTRA_CTX.is_draft_model:
                         draft_step, key = draft_attn_key_steps[attn_count]
                         metadata = attn_metadata[draft_step][key]
-                        seq_lens = metadata.seq_lens_list
+                        # GPU-side corrected KV lengths (see the comment in the
+                        # layer-aware branch above).
+                        seq_lens = metadata.seq_lens_gpu
                         actual_seq_lengths_q = metadata.actual_seq_lengths_q
                         block_tables = metadata.block_tables
                         attn_count = attn_count + 1
@@ -871,7 +895,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             sparse_mode = 0
                     else:
                         metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
-                        seq_lens = attn_metadata[metadata_key].seq_lens_list
+                        seq_lens = attn_metadata[metadata_key].seq_lens_gpu
                         actual_seq_lengths_q = attn_metadata[metadata_key].actual_seq_lengths_q
                         # NOTE:
                         # For models with sliding-window attention on the FIA full-graph replay path,
@@ -1106,7 +1130,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
-        actual_seq_lengths_kv = attn_metadata.seq_lens
+        # GPU-side corrected KV lengths. seq_lens here is the CPU optimistic
+        # mirror; seq_lens_gpu is exact even in async spec decode and aliases
+        # the model runner's persistent seq_lens buffer (stable device
+        # pointer, content updated on-stream each step), so the captured
+        # graph reads the corrected values at replay time.
+        actual_seq_lengths_kv = attn_metadata.seq_lens_gpu
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         if _EXTRA_CTX.is_draft_model:
             graph_params = get_draft_graph_params()
@@ -1335,7 +1364,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_block, block_size, -1
             )
             block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = attn_metadata.seq_lens_list
+            # GPU-side corrected KV lengths: exact in async spec decode where
+            # the CPU mirrors (seq_lens / seq_lens_list) only carry the
+            # optimistic upper bound.
+            actual_seq_lengths_kv = attn_metadata.seq_lens_gpu
         # chunked prefill.
         else:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
@@ -1346,7 +1378,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_block, block_size, -1
             )
             block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = attn_metadata.seq_lens_list
+            actual_seq_lengths_kv = attn_metadata.seq_lens_gpu
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
     def forward_fused_infer_attention(
@@ -1510,7 +1542,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
-        seq_lens_list = attn_metadata.seq_lens_list
+        # GPU-side corrected KV lengths: exact in async spec decode where the
+        # CPU mirrors only carry the optimistic upper bound. Prefill requests
+        # have no draft drift, so their GPU values are equally exact.
+        seq_lens_gpu = attn_metadata.seq_lens_gpu
         num_tokens = int(actual_seq_qlen[-1])
 
         # decode part
@@ -1525,7 +1560,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 block_size=block_size,
                 # cumulative offset from 0; leading num_decodes entries used as-is
                 actual_seq_lengths=actual_seq_qlen[:num_decodes],
-                actual_seq_lengths_kv=seq_lens_list[:num_decodes],
+                actual_seq_lengths_kv=seq_lens_gpu[:num_decodes],
                 num_key_value_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 head_size=self.head_size,
@@ -1555,7 +1590,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 input_layout="TND",
                 block_size=block_size,
                 actual_seq_lengths=prefill_seq_qlen,
-                actual_seq_lengths_kv=seq_lens_list[num_decodes:],
+                actual_seq_lengths_kv=seq_lens_gpu[num_decodes:],
                 num_key_value_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 head_size=self.head_size,
@@ -2041,7 +2076,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             key_antiquant_scale=layer._c8_k_aq_scale_nz_bnsd,
             value_antiquant_scale=layer._c8_v_aq_scale_nz_bnsd,
             block_table=attn_metadata.block_tables,
-            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+            actual_seq_lengths_kv=attn_metadata.seq_lens_gpu,
             num_heads=self.num_heads,
             num_key_value_heads=self.num_kv_heads,
             input_layout="BNSD",
@@ -2089,7 +2124,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 key_antiquant_scale=layer._c8_k_aq_scale_nz_bnsd,
                 value_antiquant_scale=layer._c8_v_aq_scale_nz_bnsd,
                 block_table=attn_metadata.block_tables[:num_decodes],
-                actual_seq_lengths_kv=attn_metadata.seq_lens_list[:num_decodes],
+                actual_seq_lengths_kv=attn_metadata.seq_lens_gpu[:num_decodes],
                 num_heads=self.num_heads,
                 num_key_value_heads=self.num_kv_heads,
                 input_layout="BNSD",
