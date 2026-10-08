@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
     KVCacheBlock,
+    dcp_world_size_for_kv_cache_spec as _upstream_dcp_world_size_for_kv_cache_spec,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
@@ -29,10 +30,26 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+
+
+def dcp_world_size_for_kv_cache_spec(kv_cache_spec, dcp_world_size):
+    """Classify per-spec DCP sharding with Ascend sliding-window specs.
+
+    The upstream classifier keeps upstream sliding-window groups replicated
+    but does not recognize the Ascend sliding-window spec subclasses
+    (e.g. the DeepSeek-V4 SWA/state ``AscendSlidingWindowMLASpec`` groups),
+    which would shard their write masks and leave every rank outside the
+    first interleave stripe with an empty cache.
+    """
+    if dcp_world_size > 1 and isinstance(kv_cache_spec, (SlidingWindowSpec, SlidingWindowMLASpec)):
+        return 1
+    return _upstream_dcp_world_size_for_kv_cache_spec(kv_cache_spec, dcp_world_size)
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
 
@@ -178,7 +195,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
+                dcp_world_size=dcp_world_size_for_kv_cache_spec(kv_cache_group.kv_cache_spec, dcp_world_size),
                 pcp_world_size=1,
                 max_in_flight_tokens=token_budget,
                 max_model_len=max_model_len,
@@ -421,7 +438,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self._cache_hit_alignment_tokens,
-                    dcp_world_size=self.dcp_world_size,
+                    dcp_world_size=dcp_world_size_for_kv_cache_spec(spec, self.dcp_world_size),
                     pcp_world_size=1,
                 )
                 hit_blocks, _new_hit_length = hit_result
@@ -483,7 +500,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle and not self.skips_eagle_block_drop,
                 alignment_tokens=self._cache_hit_alignment_tokens,
-                dcp_world_size=self.dcp_world_size,
+                dcp_world_size=dcp_world_size_for_kv_cache_spec(spec, self.dcp_world_size),
                 pcp_world_size=1,
             )
             for gid, blks in zip(group_ids, blocks):
