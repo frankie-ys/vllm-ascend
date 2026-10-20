@@ -1045,8 +1045,11 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
         """
         if self.compress_ratio != 4 or self.dcp_size == 1 or len(qli_inputs) != 3:
             return None
-        indexer_metadata = layer_metadata.indexer
-        indexer_req_metadata = _require_req_metadata(indexer_metadata)
+        # The indexer K/scale caches form their own cache group: gather with
+        # the indexer group's LOCAL block table (the attention group's table
+        # addresses the C4 KV cache -- a different set of physical blocks).
+        indexer_req_metadata = _require_req_metadata(layer_metadata.indexer.compressor.cache)
+        req_metadata = _require_req_metadata(common_metadata)
         q, weights, q_scale = qli_inputs
         (_, _, _, ik_cache, isc_cache, _) = self._unpack_kv_caches(kv_cache)
         if ik_cache is None or isc_cache is None:
@@ -1062,23 +1065,27 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             indexer_req_metadata.block_table,
         )
         num_reqs = context.num_reqs
-        query_start_loc = common_metadata.query_start_loc[: num_reqs + 1]
-        query_start_loc_cpu = common_metadata.query_start_loc_cpu[: num_reqs + 1]
+        query_start_loc = req_metadata.query_start_loc[: num_reqs + 1]
         seqused_k = context.global_cmp_seq_lens
         residual = torch.remainder(
-            self.seq_lens[:num_reqs].to(torch.int64),
-            self.compressor_ratio,
+            req_metadata.seq_lens[:num_reqs].to(torch.int64),
+            self.compress_ratio,
         ).to(torch.int32)
-        max_seqlen_q = int(torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item()) if num_reqs else 1
+        # Prefill runs eager and the workspace gathers above already host-sync,
+        # so deriving the tiling bounds from device tensors is fine here (same
+        # shapes the builder feeds the metadata op: seqused_k = len // ratio,
+        # residual = len % ratio).
+        max_seqlen_q = int(torch.max(query_start_loc[1:] - query_start_loc[:-1]).item()) if num_reqs else 1
         max_seqlen_k = int(seqused_k.max().item()) if num_reqs else 1
+        hf_config = self.vllm_config.model_config.hf_config
         # Global metadata: same op as _refresh_local_qli but with the global
         # compressed lengths (prefill runs eager, so a synchronous build with
         # step-shaped temporaries is fine).
         qli_metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
-            num_heads_q=self.model_config.hf_config.index_n_heads,
+            num_heads_q=hf_config.index_n_heads,
             num_heads_k=1,
-            head_dim=self.model_config.hf_config.index_head_dim,
-            topk=self.model_config.hf_config.index_topk,
+            head_dim=hf_config.index_head_dim,
+            topk=hf_config.index_topk,
             quant_mode=DeviceOperator.get_dsa_indexer_quant_mode(),
             cu_seqlens_q=query_start_loc,
             seqused_k=seqused_k,
@@ -1090,20 +1097,20 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             layout_k="PA_BBND",
             mask_mode=3,
             cmp_ratio=4,
-            device=str(self.seqused_q.device),
+            device=str(seqused_k.device),
         )
         # Inline op call (not indexer.select_topk): the shim metadata has no
         # registered device-metadata task, and executor.wait would KeyError
         # on the unknown id.  Indices only (return_value=0), so no fallback
         # machinery is needed either.
-        device_operator = self.indexer.device_operator
+        device_operator = self.indexer.ops.device_operator
         topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
             query=q,
             key=gathered_ik,
             weights=device_operator.prepare_dsa_indexer_weights(weights),
             query_dequant_scale=device_operator.prepare_dsa_indexer_query_scale(q_scale),
             key_dequant_scale=device_operator.prepare_dsa_indexer_key_scale(gathered_isc),
-            topk=self.model_config.hf_config.index_topk,
+            topk=hf_config.index_topk,
             quant_mode=DeviceOperator.get_dsa_indexer_quant_mode(),
             cu_seqlens_q=query_start_loc,
             seqused_k=seqused_k,
