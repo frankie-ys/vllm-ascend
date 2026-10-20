@@ -101,6 +101,77 @@ from vllm_ascend.worker.device_metadata import (
 DSA_DCP_SUPPORTED_COMPRESS_RATIOS = (4, 128)
 DSA_DCP_PAD_SLOT = -1
 
+_DCP_COMM_STREAM: torch.npu.Stream | None = None
+
+
+def _dcp_comm_stream() -> torch.npu.Stream:
+    """Dedicated stream for DCP collectives (PR-18665's overlap pattern).
+
+    Collectives issued here run concurrently with main-stream compute: the
+    decode partial-output all-reduce overlaps the replicated SWA attention
+    pass, and the prefill indexer-cache gather overlaps the attention
+    workspace gather.
+    """
+    global _DCP_COMM_STREAM
+    if _DCP_COMM_STREAM is None:
+        _DCP_COMM_STREAM = torch.npu.Stream()
+    return _DCP_COMM_STREAM
+
+
+def plan_dsa_dcp_memory(
+    available_memory: int,
+    pool_bytes_per_block: int,
+    gather_bytes_per_block: int,
+    max_gather_blocks: int,
+    decode_workspace: int,
+) -> tuple[int, int]:
+    """Fit the sharded pool and one layer's peak transient workspace together.
+
+    Ported from PR-18665's planner (same contract): the transient gather
+    workspace holds at most ``min(blocks, max_gather_blocks)`` blocks of the
+    largest sharded cache, and every layer reuses the same temporary
+    capacity, so pool size and reachable gather size must be solved together
+    rather than reserving ``max_model_len``-shaped workspaces unconditionally.
+    Returns ``(feasible_pool_bytes, workspace_bytes)``.
+    """
+    low, high = 0, max(0, available_memory // pool_bytes_per_block)
+    while low < high:
+        num_blocks = (low + high + 1) // 2
+        gather_workspace = min(num_blocks, max_gather_blocks) * gather_bytes_per_block
+        workspace = max(decode_workspace, gather_workspace)
+        if num_blocks * pool_bytes_per_block + workspace <= available_memory:
+            low = num_blocks
+        else:
+            high = num_blocks - 1
+    workspace = max(decode_workspace, min(low, max_gather_blocks) * gather_bytes_per_block)
+    return low * pool_bytes_per_block, workspace
+
+
+def profile_dsa_dcp_topk_memory(
+    num_queries: int,
+    topk: int,
+    dcp_size: int,
+    device: torch.device,
+) -> int:
+    """Measure the candidate-merge allocation peak (no collective issued).
+
+    Emulates ``merge_dsa_dcp_indexer_topk``'s tensor geometry: ``dcp_size``
+    sets of ``[num_queries, topk]`` candidates (int64 indices + fp32 scores)
+    plus the argsort/gather intermediates.  Run after saving the ordinary
+    activation profile; the reported independent peak is added to that
+    budget.
+    """
+    torch.npu.synchronize(device)
+    baseline = torch.npu.memory_allocated(device)
+    torch.npu.reset_peak_memory_stats(device)
+    idx = torch.zeros((dcp_size, num_queries, topk), dtype=torch.int64, device=device)
+    scores = torch.zeros((dcp_size, num_queries, topk), dtype=torch.float32, device=device)
+    order = torch.argsort(scores, dim=-1, descending=True)
+    picked = scores.gather(-1, order)
+    del idx, scores, order, picked
+    torch.npu.synchronize(device)
+    return torch.npu.max_memory_allocated(device) - baseline
+
 # Temporary debug instrumentation (eager mode only): set DSA_DCP_DEBUG=1 to
 # dump a bounded number of intermediate-value snapshots per rank.
 _DSA_DCP_DEBUG = os.environ.get("DSA_DCP_DEBUG") == "1"
@@ -999,6 +1070,165 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             )
         return merged.reshape(out_shape)
 
+    def _dcp_run_on_comm_stream(self, fn):
+        """Enqueue fn()'s collectives/copies on the DCP comm stream.
+
+        The main stream records a ready event first (comm work starts after
+        everything already queued on main), fn() runs inside the stream
+        context, and the main stream waits for the done event before the
+        returned tensors are consumed.  Tensors produced on the comm stream
+        are record_stream'd against the main stream so the caching allocator
+        cannot recycle them while main-stream work is still pending.
+        """
+        main = torch.npu.current_stream()
+        comm = _dcp_comm_stream()
+        ready = main.record_event()
+        with torch.npu.stream(comm):
+            comm.wait_event(ready)
+            result = fn()
+            done = comm.record_event()
+
+        def _pin(value):
+            if isinstance(value, torch.Tensor):
+                value.record_stream(main)
+            elif isinstance(value, tuple):
+                for item in value:
+                    _pin(item)
+
+        _pin(result)
+        main.wait_event(done)
+        return result
+
+    def _dcp_async_all_reduce(self, tensor: torch.Tensor):
+        """Issue all_reduce on the comm stream without blocking the caller.
+
+        ``tensor`` is modified in place; the returned event must be waited on
+        by the main stream before the tensor is read.  Under ACL graph
+        capture the fallback is a synchronous in-place reduce (stream
+        switching is not capturable); captured graphs therefore replay the
+        sync form -- identical results, only the overlap is lost.
+        """
+        if torch.npu.is_current_stream_capturing() or self.dcp_device_group is None:
+            if self.dcp_device_group is not None:
+                dist.all_reduce(tensor, group=self.dcp_device_group)
+            return None
+        main = torch.npu.current_stream()
+        comm = _dcp_comm_stream()
+        ready = main.record_event()
+        with torch.npu.stream(comm):
+            comm.wait_event(ready)
+            tensor.record_stream(comm)
+            dist.all_reduce(tensor, group=self.dcp_device_group)
+            done = comm.record_event()
+        tensor.record_stream(main)
+        return done
+
+    def _exact_prefill_topk(
+        self,
+        context: AscendDSADCPContext,
+        common_metadata,
+        qli_inputs: list,
+        kv_cache,
+    ) -> torch.Tensor | None:
+        """Exact global top-k for prefill: re-run the selection op globally.
+
+        The per-rank merge only keeps each rank's local top-k, so a candidate
+        cut by a rank's own top-k boundary can never re-enter the global
+        top-k even when its score qualifies (the documented PR-18665
+        approximation).  Re-running the selection op over the gathered global
+        indexer cache removes the approximation: the op sees every global
+        candidate with the exact quantized query/weights this step produced,
+        so the result matches the non-DCP selection bit-for-bit.
+
+        The indexer-cache gathers run on the comm stream and overlap with the
+        attention workspace gather that follows on the main stream.  Returns
+        None when the re-run is not applicable (caller falls back to merge).
+        """
+        if self.compress_ratio != 4 or self.dcp_size == 1 or len(qli_inputs) != 3:
+            return None
+        req_metadata = _require_req_metadata(common_metadata)
+        q, weights, q_scale = qli_inputs
+        (_, _, _, ik_cache, isc_cache, _) = self._unpack_kv_caches(kv_cache)
+        if ik_cache is None or isc_cache is None:
+            return None
+        # The indexer K/scale caches are slots of the SAME kv-cache group as
+        # the compressed KV (group 0): one physical pool, one block table.
+        # Gather them with the exact table the compress-cache gather uses.
+        indexer_block_table = req_metadata.block_table
+        gathered_ik, gathered_table = self._dcp_run_on_comm_stream(
+            lambda: self._gather_prefill_cmp_workspace(
+                ik_cache,
+                context,
+                indexer_block_table,
+            )
+        )
+        gathered_isc, _ = self._dcp_run_on_comm_stream(
+            lambda: self._gather_prefill_cmp_workspace(
+                isc_cache,
+                context,
+                indexer_block_table,
+            )
+        )
+        num_reqs = context.num_reqs
+        query_start_loc = req_metadata.query_start_loc[: num_reqs + 1]
+        seqused_k = context.global_cmp_seq_lens
+        # Global tail residual: raw seq len mod the compression ratio (the
+        # same quantity the non-DCP builder feeds as cmp_residual_k).
+        residual = torch.remainder(
+            req_metadata.seq_lens[:num_reqs].to(torch.int64),
+            self.compress_ratio,
+        ).to(torch.int32)
+        # Prefill runs eager, so host reads of step-shaped scalars are fine
+        # (the non-DCP path derives the same scalars from CPU metadata).
+        max_seqlen_q = int((query_start_loc[1:] - query_start_loc[:-1]).max().item()) if num_reqs else 1
+        max_seqlen_k = int(seqused_k.max().item()) if num_reqs else 1
+        # Global metadata: same op as _refresh_local_qli but with the global
+        # compressed lengths (prefill runs eager, so a synchronous build with
+        # step-shaped temporaries is fine).
+        hf_config = self.vllm_config.model_config.hf_config
+        qli_metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+            num_heads_q=hf_config.index_n_heads,
+            num_heads_k=1,
+            head_dim=hf_config.index_head_dim,
+            topk=hf_config.index_topk,
+            quant_mode=DeviceOperator.get_dsa_indexer_quant_mode(),
+            cu_seqlens_q=query_start_loc,
+            seqused_k=seqused_k,
+            cmp_residual_k=residual,
+            batch_size=num_reqs,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            cmp_ratio=4,
+            device=str(q.device),
+        )
+        # Inline op call (not indexer.select_topk): the shim metadata has no
+        # registered device-metadata task, and executor.wait would KeyError
+        # on the unknown id.  Indices only (return_value=0), so no fallback
+        # machinery is needed either.
+        topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
+            query=q,
+            key=gathered_ik,
+            weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
+            query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
+            key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(gathered_isc),
+            topk=hf_config.index_topk,
+            quant_mode=DeviceOperator.get_dsa_indexer_quant_mode(),
+            cu_seqlens_q=query_start_loc,
+            seqused_k=seqused_k,
+            cmp_residual_k=residual,
+            block_table=gathered_table,
+            metadata=qli_metadata,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            cmp_ratio=4,
+            return_value=0,
+        )
+        return topk_idxs
+
     def _maybe_update_compressed_caches_and_select_topk(
         self,
         layer_name,
@@ -1069,6 +1299,7 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             scatter_attention_compressed_kv=scatter_attention_compressed_kv,
             aux_stream=None,
         )
+        qli_inputs: list = []
         local_topk_indices, local_topk_values = self.indexer(
             hidden_states=hidden_states,
             qr=qr,
@@ -1079,6 +1310,7 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             qr_pertoken_scale=qr_pertoken_scale,
             write_cache=write_cache,
             return_topk_values=True,
+            qli_inputs_out=qli_inputs,
         )
         # Keep EVERY row the indexer produced: `cmp_sparse_indices` must have
         # the same first dimension as the query the attention op sees.  Under
@@ -1088,6 +1320,18 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
         # to the last real request and their candidates resolve to -1, which
         # the op skips.
         num_rows = local_topk_indices.shape[0]
+        if context.has_prefill and self.compress_ratio == 4:
+            # Re-run the selection op over the gathered global indexer cache
+            # (exact top-k; the rank-local merge is approximate at equal
+            # scores).  Decode keeps the merge (graph-safe, no extra gathers).
+            exact = self._exact_prefill_topk(
+                context,
+                common_metadata,
+                qli_inputs,
+                kv_cache,
+            )
+            if exact is not None:
+                return exact
         return self._merge_indexer_topk(
             local_topk_indices,
             local_topk_values,
@@ -1164,6 +1408,41 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             lines.append(f"    indexer_k_cache   = {_mb(indexer_k_cache)}")
         if indexer_scale_cache is not None:
             lines.append(f"    indexer_scale     = {_mb(indexer_scale_cache)}")
+        # Memory-plan report (PR-18665's planner adapted): check that the
+        # sharded pool plus one layer's peak transient workloads fit in this
+        # rank's HBM headroom.  Debug-only and one-shot, so the profiler's
+        # synchronize/allocation churn is acceptable here.
+        try:
+            device = compress_kv_cache.device
+            page_bytes = compress_kv_cache[0].numel() * compress_kv_cache.element_size()
+            pool_bytes = sum(
+                t.numel() * t.element_size()
+                for t in (compress_kv_cache, swa_kv_cache, state_cache, indexer_k_cache, indexer_scale_cache)
+                if t is not None
+            )
+            available = torch.npu.get_device_properties(device).total_memory
+            headroom = available - torch.npu.memory_allocated(device)
+            merge_peak = profile_dsa_dcp_topk_memory(
+                num_queries=1,
+                topk=self.vllm_config.model_config.hf_config.index_topk,
+                dcp_size=self.dcp_size,
+                device=device,
+            )
+            feasible_pool, workspace = plan_dsa_dcp_memory(
+                available_memory=headroom + pool_bytes,
+                pool_bytes_per_block=page_bytes,
+                gather_bytes_per_block=page_bytes,
+                max_gather_blocks=compress_kv_cache.shape[0],
+                decode_workspace=merge_peak,
+            )
+            fit = "OK" if feasible_pool >= pool_bytes else "OVER"
+            lines.append(
+                f"  plan: pool={pool_bytes >> 20} MiB page={page_bytes >> 10} KiB"
+                f" merge_peak={merge_peak >> 20} MiB workspace={workspace >> 20} MiB"
+                f" feasible_pool={feasible_pool >> 20} MiB fit={fit}"
+            )
+        except Exception as plan_exc:  # pragma: no cover - diagnostic only
+            lines.append(f"  plan: unavailable ({plan_exc})")
         print("\n".join(lines), flush=True)
 
     def _forward_attention_decode_dcp(
@@ -1296,6 +1575,12 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
 
         with attention_transfer_window():
             attn_output, softmax_lse = attn_op(q, **attn_kwargs)
+        # Issue the cross-rank reduction of the fused partials on the comm
+        # stream NOW so the collectives overlap with the SWA-only pass below:
+        # the reduction depends only on the fused output, and the SWA pass is
+        # independent of it (PR-18665's overlap pattern adapted to the
+        # fused+dedup merge).
+        merge_state = self._dcp_decode_merge_reduce(attn_output, softmax_lse, q.shape[0], q.shape[1])
         # SWA-only pass: every fused per-rank output contains the identical
         # replicated SWA term; the plain LSE merge would count it dcp_size
         # times.  Re-run the op with cmp disabled to recover that term exactly
@@ -1324,23 +1609,43 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(context.swa_only_sas_metadata))
         with attention_transfer_window():
             swa_output, swa_lse = attn_op(q, **swa_kwargs)
-        return self._merge_dsa_dcp_decode_output(
-            attn_output,
-            softmax_lse,
-            swa_output,
-            swa_lse,
-            q.shape[0],
-            q.shape[1],
-        )
+        return self._dcp_decode_merge_combine(*merge_state, swa_output, swa_lse)
 
-    def _merge_dsa_dcp_decode_output(
+    def _dcp_decode_merge_reduce(
         self,
         attn_output: torch.Tensor,
         softmax_lse: torch.Tensor,
-        swa_output: torch.Tensor,
-        swa_lse: torch.Tensor,
         num_tokens: int,
         num_gathered_heads: int,
+    ):
+        """fp32 exp-space partial sums + comm-stream all-reduces (async).
+
+        Returns the state tuple consumed by ``_dcp_decode_merge_combine``:
+        ``(out, lse, sums_out, z, sums_done, z_done, out_dtype)``.  The
+        reductions depend only on this rank's fused output, so issuing them
+        here lets the collectives overlap the SWA-only pass that follows on
+        the main stream.
+        """
+        head_dim = attn_output.shape[-1]
+        out = attn_output.reshape(num_tokens, num_gathered_heads, head_dim).to(torch.float32)
+        lse = softmax_lse.reshape(num_tokens, num_gathered_heads, -1).to(torch.float32)
+        z = torch.exp(lse)
+        sums_out = z * out
+        sums_done = self._dcp_async_all_reduce(sums_out)
+        z_done = self._dcp_async_all_reduce(z)
+        return (out, lse, sums_out, z, sums_done, z_done, attn_output.dtype)
+
+    def _dcp_decode_merge_combine(
+        self,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        sums_out: torch.Tensor,
+        z: torch.Tensor,
+        sums_done,
+        z_done,
+        out_dtype: torch.dtype,
+        swa_output: torch.Tensor,
+        swa_lse: torch.Tensor,
     ) -> torch.Tensor:
         """Exact DCP merge for DSA decode with a replicated SWA part.
 
@@ -1359,25 +1664,17 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
         all-to-all path performs, done as a post-merge slice here).
         """
         dcp = self.dcp_size
-        if dcp == 1:
-            return attn_output
-        # Normalize TND outputs to [T, H_gathered, D] and LSEs to
-        # [T, H_gathered, 1] (defensive: flattened [T*H, ...] layouts reshape
-        # back to the same tensors).
-        head_dim = attn_output.shape[-1]
-        attn_output = attn_output.reshape(num_tokens, num_gathered_heads, head_dim)
-        softmax_lse = softmax_lse.reshape(num_tokens, num_gathered_heads, -1)
-        swa_output = swa_output.reshape(num_tokens, num_gathered_heads, head_dim)
-        swa_lse = swa_lse.reshape(num_tokens, num_gathered_heads, -1)
-        out = attn_output.to(torch.float32)
-        lse = softmax_lse.to(torch.float32)
-        z = torch.exp(lse)
-        sums_out = z * out
-        dist.all_reduce(sums_out, group=self.dcp_device_group)
-        dist.all_reduce(z, group=self.dcp_device_group)
-        swa_z = torch.exp(swa_lse.to(torch.float32))
+        num_tokens, num_gathered_heads = out.shape[0], out.shape[1]
+        main = torch.npu.current_stream()
+        if sums_done is not None:
+            main.wait_event(sums_done)
+        if z_done is not None:
+            main.wait_event(z_done)
+        swa_output = swa_output.reshape(num_tokens, num_gathered_heads, -1).to(torch.float32)
+        swa_lse = swa_lse.reshape(num_tokens, num_gathered_heads, -1).to(torch.float32)
+        swa_z = torch.exp(swa_lse)
         dup = dcp - 1
-        num = sums_out - dup * swa_z * swa_output.to(torch.float32)
+        num = sums_out - dup * swa_z * swa_output
         den = z - dup * swa_z
         tiny = torch.finfo(torch.float32).tiny
         merged = torch.where(den > 0, num / den.clamp_min(tiny), torch.zeros_like(den))
@@ -1389,11 +1686,11 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
                 f" den[{den.min().item():.3f},{den.max().item():.3f}]"
                 f" nonpos={int((den <= 0).sum())}"
                 f" out_absmax={out.abs().max().item():.3f}"
-                f" swa_absmax={swa_output.to(torch.float32).abs().max().item():.3f}",
+                f" swa_absmax={swa_output.abs().max().item():.3f}",
             )
         h0 = self.dcp_rank * self.n_local_heads
         own = merged[:, h0 : h0 + self.n_local_heads, :]
-        return own.to(attn_output.dtype)
+        return own.to(out_dtype)
 
     def _forward_attention_prefill_gather(
         self,

@@ -372,6 +372,7 @@ class AscendIndexerOps:
         slot_mapping: torch.Tensor,
         metadata: typing.Any,
         return_values: bool = False,
+        qli_inputs_out: list | None = None,
     ):
         query, query_scale, _, _ = self.device_operator.indexer_quant_scatter(
             query,
@@ -381,6 +382,12 @@ class AscendIndexerOps:
             full_cache,
             slot_mapping,
         )
+        if qli_inputs_out is not None:
+            # Hand the post-scatter query (quantized), raw weights and query
+            # scale to the caller: DSA-DCP re-runs select_topk against a
+            # gathered global cache with these exact tensors, reproducing the
+            # non-DCP selection bit-for-bit without recomputing anything.
+            qli_inputs_out.extend([query, weights, query_scale])
         return self.select_topk(
             query,
             weights,
@@ -544,6 +551,7 @@ class DeepseekV4Indexer(nn.Module):
         qr_pertoken_scale: torch.Tensor | None = None,
         write_cache: bool = True,
         return_topk_values: bool = False,
+        qli_inputs_out: list | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         num_tokens = hidden_states.shape[0]
         cache_metadata, _ = self._get_indexer_cache_metadata(metadata)
@@ -590,6 +598,7 @@ class DeepseekV4Indexer(nn.Module):
                 qr_pertoken_scale,
                 write_cache=write_cache,
                 return_values=return_topk_values,
+                qli_inputs_out=qli_inputs_out,
             )
             if return_topk_values:
                 topk_indices, topk_values = topk_result
@@ -842,6 +851,7 @@ class DeepseekV4Indexer(nn.Module):
         qr_pertoken_scale: torch.Tensor | None = None,
         write_cache: bool = True,
         return_values: bool = False,
+        qli_inputs_out: list | None = None,
     ):
         q, kv, ik, isc, ifc, cache_metadata, indexer_slot_mapping = self._indexer_qkv_prepare(
             x,
@@ -867,6 +877,7 @@ class DeepseekV4Indexer(nn.Module):
                 indexer_slot_mapping,
                 cache_metadata,
                 return_values=return_values,
+                qli_inputs_out=qli_inputs_out,
             )
 
         q, q_scale = self.ops.quantize_query(q)
