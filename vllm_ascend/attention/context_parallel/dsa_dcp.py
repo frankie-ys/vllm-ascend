@@ -70,7 +70,6 @@ import os
 import torch
 import torch.distributed as dist
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 
 from vllm_ascend.attention.context_parallel.common_cp import (
     DCPImplMixin,
@@ -225,15 +224,18 @@ def get_dsa_dcp_local_compressed_seq_lens(
     A compression group is owned by exactly one rank (interleave is a
     multiple of the ratio), so the local compressed length is the local raw
     length of the group-aligned prefix divided by the ratio.
+
+    The striping math is inlined (instead of the upstream
+    ``get_dcp_local_seq_lens`` helper) because that helper materializes an
+    NPU scalar, forcing a host sync against the previous decode on every
+    call.
     """
     _compressed_stripe_len(interleave_size, compress_ratio)
     group_aligned = torch.div(seq_lens_cpu.to(torch.int64), compress_ratio, rounding_mode="floor") * compress_ratio
-    local_raw = get_dcp_local_seq_lens(
-        group_aligned,
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
-        cp_kv_cache_interleave_size=interleave_size,
-    ).to(torch.int64)
+    cycle = interleave_size * dcp_size
+    base = torch.div(group_aligned, cycle, rounding_mode="floor") * interleave_size
+    tail = (torch.remainder(group_aligned, cycle) - dcp_rank * interleave_size).clamp(0, interleave_size)
+    local_raw = base + tail
     return torch.div(local_raw, compress_ratio, rounding_mode="floor").to(torch.int32)
 
 
@@ -761,6 +763,23 @@ class AscendDSADCPMetadataBuilder(DCPMetadataBuilderMixin, AscendDSAMetadataBuil
         self.swa_sas_metadata_buffer[:DSA_METADATA_BUFFER_SIZE] = swa_metadata[:DSA_METADATA_BUFFER_SIZE]
         return self.swa_sas_metadata_buffer
 
+    def _dcp_qli_max_seqlen_k(self) -> int:
+        """Static upper bound of the rank-local compressed length.
+
+        With interleave striping a rank owns at most ``ceil(G / dcp) + storage``
+        compressed positions of a request whose global compressed length is G
+        (each virtual block contributes at most one full storage block per
+        rank), so this bound is exact for every batch shape.  It only shapes
+        the metadata operator's tiling; over-estimation costs scheduling
+        headroom, never correctness.  Deriving it from the device-side local
+        lens would force a host sync that drains the whole queue (~82 ms per
+        step in profiles).
+        """
+        if not hasattr(self, "_dcp_qli_max_seqlen_k_bound"):
+            g_max = cdiv(self.vllm_config.model_config.max_model_len, self.compressor_ratio)
+            self._dcp_qli_max_seqlen_k_bound = cdiv(g_max, self.dcp_size) + self.storage_block_size
+        return self._dcp_qli_max_seqlen_k_bound
+
     def _refresh_local_qli(
         self,
         context: AscendDSADCPContext,
@@ -781,8 +800,11 @@ class AscendDSADCPMetadataBuilder(DCPMetadataBuilderMixin, AscendDSAMetadataBuil
         max_seqlen_q = int(torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item())
         self.qli_seqused_k[:num_reqs].copy_(context.local_cmp_seq_lens)
         self.qli_cmp_residual_k[:num_reqs].copy_(self.dcp_local_cmp_residual_buf[:num_reqs])
-        local_cmp = context.local_cmp_seq_lens
-        max_local_cmp = int(local_cmp.max().item()) if num_reqs else 1
+        # Static bound instead of local_cmp.max().item(): the device-side max
+        # forces a host sync that drains the whole queue (~82 ms per step in
+        # profiles).  max_seqlen_k only shapes the metadata operator's tiling
+        # -- the real per-request lengths come from the device seqused_k.
+        max_local_cmp = self._dcp_qli_max_seqlen_k()
         # Drop the base async INDEXER task: it would rebuild with global
         # compressed lengths after this synchronous local refresh.
         self._drop_device_metadata_tasks(DeviceMetadataStage.INDEXER)
@@ -999,6 +1021,103 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             )
         return merged.reshape(out_shape)
 
+    def _exact_prefill_topk(
+        self,
+        layer_metadata,
+        context: AscendDSADCPContext,
+        common_metadata,
+        qli_inputs: list,
+        kv_cache,
+    ) -> torch.Tensor | None:
+        """Exact global top-k for prefill: re-run the selection op globally.
+
+        The selection kernel derives each query's causal horizon from the
+        request's cached KV length in ITS OWN coordinate space.  Under DCP
+        the local cache is an interleaved subset of the global sequence, so
+        for a multi-token prefill chunk that horizon is only correct for the
+        chunk's last token.  Gathering the indexer K/scale caches into
+        global order (identity block table, global seqused_k) and re-running
+        the selection op with the step's exact quantized query/weights
+        restores the non-DCP coordinate system, where the kernel's causal
+        logic is exact -- the result matches the non-DCP selection
+        bit-for-bit.  Returns None when the re-run is not applicable (caller
+        falls back to the merge path).
+        """
+        if self.compress_ratio != 4 or self.dcp_size == 1 or len(qli_inputs) != 3:
+            return None
+        indexer_metadata = layer_metadata.indexer
+        indexer_req_metadata = _require_req_metadata(indexer_metadata)
+        q, weights, q_scale = qli_inputs
+        (_, _, _, ik_cache, isc_cache, _) = self._unpack_kv_caches(kv_cache)
+        if ik_cache is None or isc_cache is None:
+            return None
+        gathered_ik, gathered_table = self._gather_prefill_cmp_workspace(
+            ik_cache,
+            context,
+            indexer_req_metadata.block_table,
+        )
+        gathered_isc, _ = self._gather_prefill_cmp_workspace(
+            isc_cache,
+            context,
+            indexer_req_metadata.block_table,
+        )
+        num_reqs = context.num_reqs
+        query_start_loc = common_metadata.query_start_loc[: num_reqs + 1]
+        query_start_loc_cpu = common_metadata.query_start_loc_cpu[: num_reqs + 1]
+        seqused_k = context.global_cmp_seq_lens
+        residual = torch.remainder(
+            self.seq_lens[:num_reqs].to(torch.int64),
+            self.compressor_ratio,
+        ).to(torch.int32)
+        max_seqlen_q = int(torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item()) if num_reqs else 1
+        max_seqlen_k = int(seqused_k.max().item()) if num_reqs else 1
+        # Global metadata: same op as _refresh_local_qli but with the global
+        # compressed lengths (prefill runs eager, so a synchronous build with
+        # step-shaped temporaries is fine).
+        qli_metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+            num_heads_q=self.model_config.hf_config.index_n_heads,
+            num_heads_k=1,
+            head_dim=self.model_config.hf_config.index_head_dim,
+            topk=self.model_config.hf_config.index_topk,
+            quant_mode=DeviceOperator.get_dsa_indexer_quant_mode(),
+            cu_seqlens_q=query_start_loc,
+            seqused_k=seqused_k,
+            cmp_residual_k=residual,
+            batch_size=num_reqs,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            cmp_ratio=4,
+            device=str(self.seqused_q.device),
+        )
+        # Inline op call (not indexer.select_topk): the shim metadata has no
+        # registered device-metadata task, and executor.wait would KeyError
+        # on the unknown id.  Indices only (return_value=0), so no fallback
+        # machinery is needed either.
+        device_operator = self.indexer.device_operator
+        topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
+            query=q,
+            key=gathered_ik,
+            weights=device_operator.prepare_dsa_indexer_weights(weights),
+            query_dequant_scale=device_operator.prepare_dsa_indexer_query_scale(q_scale),
+            key_dequant_scale=device_operator.prepare_dsa_indexer_key_scale(gathered_isc),
+            topk=self.model_config.hf_config.index_topk,
+            quant_mode=DeviceOperator.get_dsa_indexer_quant_mode(),
+            cu_seqlens_q=query_start_loc,
+            seqused_k=seqused_k,
+            cmp_residual_k=residual,
+            block_table=gathered_table,
+            metadata=qli_metadata,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            cmp_ratio=4,
+            return_value=0,
+        )
+        return topk_idxs
+
     def _maybe_update_compressed_caches_and_select_topk(
         self,
         layer_name,
@@ -1069,6 +1188,7 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             scatter_attention_compressed_kv=scatter_attention_compressed_kv,
             aux_stream=None,
         )
+        qli_inputs: list = []
         local_topk_indices, local_topk_values = self.indexer(
             hidden_states=hidden_states,
             qr=qr,
@@ -1079,6 +1199,7 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             qr_pertoken_scale=qr_pertoken_scale,
             write_cache=write_cache,
             return_topk_values=True,
+            qli_inputs_out=qli_inputs,
         )
         # Keep EVERY row the indexer produced: `cmp_sparse_indices` must have
         # the same first dimension as the query the attention op sees.  Under
@@ -1088,6 +1209,23 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
         # to the last real request and their candidates resolve to -1, which
         # the op skips.
         num_rows = local_topk_indices.shape[0]
+        if context.has_prefill and self.compress_ratio == 4:
+            # Prefill batches carry multiple query tokens per request, so the
+            # selection kernel's causal horizon (derived from the request's
+            # local compressed length) is only correct for the chunk's last
+            # token -- earlier queries would attend to compression groups
+            # that are causally after them.  Re-running the selection over
+            # the gathered GLOBAL indexer cache restores global coordinates,
+            # where the kernel's causal logic is exact (same as non-DCP).
+            exact = self._exact_prefill_topk(
+                layer_metadata,
+                context,
+                common_metadata,
+                qli_inputs,
+                kv_cache,
+            )
+            if exact is not None:
+                return exact
         return self._merge_indexer_topk(
             local_topk_indices,
             local_topk_values,

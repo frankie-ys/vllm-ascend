@@ -808,6 +808,19 @@ class AscendConfig:
                 raise ValueError(
                     "DSA DCP cannot be combined with prefill context parallelism (PCP)."
                 )
+            if (
+                getattr(vc, "speculative_config", None) is not None
+                and vc.speculative_config.num_speculative_tokens > 0
+            ):
+                # Speculative decode issues multiple query tokens per step; the
+                # Python-only prefill causal-horizon fix cannot express the
+                # per-query compressed-view boundary for those extra draft
+                # positions (the kernel-level dcp_context fix is required).
+                raise NotImplementedError(
+                    "DeepSeek-V4 DCP does not support speculative decoding in this "
+                    "build. Disable --speculative-config or use the kernel-level "
+                    "dcp_context variant."
+                )
             interleave = vc.parallel_config.cp_kv_cache_interleave_size
             block_size = vc.cache_config.block_size
             max_compress_ratio = 128
