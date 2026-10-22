@@ -326,13 +326,26 @@ def merge_dsa_dcp_indexer_topk(
     displace the real ones.  Invalid entries are turned into -1 indices with
     -inf scores so they can never win the merge; surviving -1 slots are
     skipped by the attention kernel (same contract as foreign-owned slots).
+
+    Selection avoids the two row-major permutations and the full ``argsort``
+    the merge used to need.  The gathered buffer is reinterpreted as BF16 in
+    place (no copy) and only the score view is materialised once, in the
+    logical ``[rows, world*topk]`` order via a fused permute+cast; the
+    selected indices are then resolved straight out of the rank-major buffer
+    with flat offsets.  ``topk`` replaces ``argsort`` (O(n log n) on up to
+    1e8 elements at prefill batch sizes).  Ties may be ordered differently
+    than a stable sort would, which is harmless: the candidate order and the
+    selection kernel are identical on every rank, so the merged result stays
+    deterministic across ranks, and tied candidates carry equal scores.
     """
     topk = local_topk_indices.shape[-1]
-    flat_idx = local_topk_indices.reshape(-1, topk).to(torch.int64)
-    flat_val = local_topk_values.reshape(-1, topk)
+    rows = local_topk_indices.shape[0]
+    world = dcp_group.world_size
+    flat_idx = local_topk_indices.reshape(rows, topk).to(torch.int64)
+    flat_val = local_topk_values.reshape(rows, topk)
     global_idx = dsa_dcp_local_cmp_to_global(
         flat_idx,
-        dcp_group.world_size,
+        world,
         dcp_rank,
         interleave_size,
         compress_ratio,
@@ -346,21 +359,33 @@ def merge_dsa_dcp_indexer_topk(
     score_words = scores.contiguous().view(torch.int32)
     packed = torch.cat([global_idx, score_words], dim=-1).unsqueeze(0)
     gathered = dcp_group.all_gather(packed.contiguous(), dim=0)
-    rows = packed.shape[1]
-    all_indices = gathered[..., :topk].permute(1, 0, 2).reshape(rows, dcp_group.world_size * topk)
-    all_scores = (
-        gathered[..., topk:]
-        .contiguous()
-        .view(torch.bfloat16)
-        .permute(1, 0, 2)
-        .reshape(rows, dcp_group.world_size * topk)
-        .to(torch.float32)
-    )
-    topk_order = torch.argsort(-all_scores, dim=-1, stable=True)[..., :topk]
-    merged = torch.gather(all_indices, dim=-1, index=topk_order)
-    selected_scores = torch.gather(all_scores, dim=-1, index=topk_order)
-    # Garbage slots never carry a real index into the attention op.
-    merged = torch.where(torch.isfinite(selected_scores), merged, torch.full_like(merged, -1))
+    width = gathered.shape[-1]
+
+    if world > 1:
+        # Whole payload as BF16: each INT32 word holds two packed scores, so
+        # the score region (words [topk:]) starts at element 2*topk.  The cast
+        # to fp32 is bf16-exact, so no precision is lost versus selecting in
+        # bf16, and it lands directly in row-major order (permute first, then
+        # cast -> one copy, reshape free).
+        row_scores = (
+            gathered.view(torch.bfloat16)[..., 2 * topk :]
+            .permute(1, 0, 2)
+            .to(torch.float32)
+            .reshape(rows, world * topk)
+        )
+        sel_scores, sel_pos = torch.topk(row_scores, k=topk, dim=-1, largest=True, sorted=False)
+        src_rank = torch.div(sel_pos, topk, rounding_mode="floor")
+        src_j = sel_pos - src_rank * topk
+        row_ids = torch.arange(rows, dtype=torch.int64, device=sel_pos.device).unsqueeze(1)
+        # Resolve the selected candidate's index straight from the rank-major
+        # buffer (no row-major copy of all indices).
+        flat_off = (src_rank * rows + row_ids) * width + src_j
+        merged = gathered.reshape(-1).gather(0, flat_off.reshape(-1)).reshape(rows, topk).to(torch.int64)
+        # Garbage slots never carry a real index into the attention op.
+        merged = torch.where(torch.isfinite(sel_scores), merged, torch.full_like(merged, -1))
+    else:
+        # Single rank: the local selection is already the global top-k.
+        merged = global_idx.to(torch.int64)
     return merged.reshape(local_topk_indices.shape).to(local_topk_indices.dtype)
 
 
@@ -401,6 +426,15 @@ class AscendDSADCPContext:
         # SWA-only (cmp disabled) sas metadata for the decode merge SWA
         # correction (built by the builder, consumed by the impl).
         self.swa_only_sas_metadata: torch.Tensor | None = None
+        # Per-step prefill gather plan (block compaction ids, ownership
+        # mapping, source/destination token positions, identity block table and
+        # the step-scoped gather/workspace buffers).  Every layer of a step
+        # shares the same block table and sequence lengths, so the plan is
+        # built once and reused.
+        self.prefill_plan: dict | None = None
+        # Host mirror of the raw sequence lengths, supplied by the builder
+        # (the impl never sees the common metadata that carries it).
+        self.seq_lens_cpu: torch.Tensor | None = None
 
 
 class AscendDSADCPMetadata(AscendDSAMetadata):
@@ -543,6 +577,10 @@ class AscendDSADCPMetadataBuilder(DCPMetadataBuilderMixin, AscendDSAMetadataBuil
             has_prefill=self.num_prefills > 0,
             num_reqs=num_reqs,
         )
+        # The impl only ever sees the layer-level metadata (which carries no
+        # host mirror), so hand it the builder's CPU sequence lengths. Prefill
+        # sizing then costs no device-to-host sync in the impl.
+        context.seq_lens_cpu = self._seq_lens_cpu(common_attn_metadata)[:num_reqs]
         context.causal_context = self.dcp_causal_context_buf
         req_metadata.dcp_causal_context = context.causal_context
 
@@ -1514,34 +1552,82 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
         with attention_transfer_window():
             return attn_op(q, **attn_kwargs)[0]
 
-    def _gather_prefill_cmp_workspace(
+    def _prefill_workspace_plan(
         self,
         compress_kv_cache: torch.Tensor,
         context: AscendDSADCPContext,
         local_block_table: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """All-gather the compressed KV and lay it out in global order.
+    ) -> dict:
+        """Build the per-STEP prefill gather plan (shared by every layer).
 
-        Each rank contributes the compacted set of local blocks referenced
-        by this batch (uniformly padded so a single all-gather works), plus
-        its local block table.  Every global compressed position is then
-        copied from the owning rank's segment into a workspace block via a
-        token-granularity indexed copy, yielding a cache the attention op
-        can read with global semantics through an identity block table.
+        Block compaction ids, ownership mapping, source/destination token
+        positions, the identity block table and the gather/workspace buffers
+        depend only on the batch's block table and sequence lengths, so they
+        are identical for every layer of a step.  Building them once per step
+        removes ~20 tensor ops and every device-to-host sync from the
+        per-layer path.
+
+        All sizes come from the host mirrors: a device ``.item()`` here would
+        drain the prefill queue once per layer.  Buffers are STEP-scoped (not
+        cached per impl) so they exist once per batch rather than once per
+        attention layer.
         """
-        storage = context.storage_block_size
         num_reqs = context.num_reqs
+        # The plan lives on the per-step context, so it is already scoped to a
+        # single step and needs no identity key.  The block table is a
+        # persistent worker buffer whose data_ptr never changes across steps,
+        # so a pointer-based key could never detect content changes; verify
+        # the batch geometry instead and rebuild the plan on any mismatch.
+        plan = context.prefill_plan
+        table_shape = local_block_table.shape
+        block_shape = compress_kv_cache.shape[1:]
+        if plan is not None and (
+            plan["num_reqs"] == num_reqs
+            and plan["table_shape"] == table_shape
+            and plan["block_shape"] == block_shape
+        ):
+            return plan
+
+        storage = context.storage_block_size
         device = compress_kv_cache.device
-        global_cmp = context.global_cmp_seq_lens.to(torch.int64)
-        blocks_per_req = cdiv(global_cmp, storage).clamp(min=0)
-        total_ws_blocks = int(blocks_per_req.sum().item())
+        plan = {
+            "num_reqs": num_reqs,
+            "table_shape": table_shape,
+            "block_shape": block_shape,
+            "total_ws_blocks": 0,
+        }
+        if num_reqs == 0:
+            context.prefill_plan = plan
+            return plan
+        # Host sizing for the prefill workspace.  The impl only sees the
+        # layer-level metadata, so it uses the CPU mirror the builder attached
+        # to the context; the device fallback costs one sync per STEP and
+        # produces the identical compressed lengths.
+        seq_lens_cpu_src = context.seq_lens_cpu
+        if seq_lens_cpu_src is not None:
+            g_cmp_cpu = torch.div(
+                seq_lens_cpu_src[:num_reqs].to(torch.int64),
+                context.compress_ratio,
+                rounding_mode="floor",
+            )
+        else:
+            g_cmp_cpu = context.global_cmp_seq_lens[:num_reqs].to(torch.int64).cpu()
+        blocks_cpu = torch.div(g_cmp_cpu + (storage - 1), storage, rounding_mode="floor").clamp(min=0)
+        total_ws_blocks = int(blocks_cpu.sum().item())
+        plan["total_ws_blocks"] = total_ws_blocks
         if total_ws_blocks == 0:
-            return compress_kv_cache, local_block_table[:num_reqs]
+            context.prefill_plan = plan
+            return plan
+        max_cmp = int(g_cmp_cpu.max().item())
+        max_blocks_per_req = int(blocks_cpu.max().item())
+        blocks_per_req = blocks_cpu.to(device=device)
 
         table = local_block_table.to(torch.int64)
         num_cols = table.shape[1]
-        # Compact this rank's referenced local blocks (sorted unique ids).
-        valid_block_ids, _ = table[:num_reqs].flatten().unique(return_inverse=True)
+        # The referenced-block set is table-only.  Prefix-cache sharing makes
+        # it smaller than the workspace block count, so compacting still pays;
+        # the single sync it needs is amortised over every layer of the step.
+        valid_block_ids = table[:num_reqs].flatten().unique()
         num_valid = int(valid_block_ids.shape[0])
         # Uniform segment size across ranks for the collective gathers.
         size_tensor = torch.tensor([num_valid], dtype=torch.int64, device=device)
@@ -1568,16 +1654,6 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             gathered_ids = local_ids.unsqueeze(0)
         gathered_ids = gathered_ids.reshape(self.dcp_size, max_valid)
 
-        # Segment 2: compacted KV blocks, zero-padded.
-        block_shape = compress_kv_cache.shape[1:]
-        local_blocks = compress_kv_cache.new_zeros((max_valid, *block_shape))
-        local_blocks[:num_valid] = compress_kv_cache[valid_block_ids.clamp(max=compress_kv_cache.shape[0] - 1)]
-        if self.dcp_size > 1:
-            gathered_pool = self.dcp_group.all_gather(local_blocks, dim=0)
-        else:
-            gathered_pool = local_blocks.unsqueeze(0)
-        gathered_pool = gathered_pool.reshape(self.dcp_size * max_valid, *block_shape)
-
         # Segment 3: per-rank local block tables (same shape on every rank).
         if self.dcp_size > 1:
             gathered_tables = self.dcp_group.all_gather(table[:num_reqs].contiguous(), dim=0)
@@ -1593,7 +1669,8 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
         # implicit broadcasting makes the searchsorted below see boundaries
         # [1, max_cmp, max_valid] against values [num_reqs, max_cmp, 1], which
         # only happens to match when num_reqs == 1 (single-request batches).
-        max_cmp = int(global_cmp.max().item())
+        # max_cmp was derived from the host mirror above (no device sync).
+        global_cmp = context.global_cmp_seq_lens.to(torch.int64)
         req_row = torch.arange(num_reqs, dtype=torch.int64, device=device).unsqueeze(1)
         pos = torch.arange(max_cmp, dtype=torch.int64, device=device).unsqueeze(0).expand(num_reqs, -1)
         owner, local_pos = dsa_dcp_global_cmp_to_local(
@@ -1630,18 +1707,8 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
         take = in_range & compact_valid & (src_blocks >= 0)
         src_token = (owner.clamp(0, self.dcp_size - 1) * max_valid + compact_idx) * storage + local_off
         dst_token = ws_block * storage + ws_off
-        ws = compress_kv_cache.new_zeros((total_ws_blocks, *block_shape))
-        # Token-granularity views: one row per compressed token (block_shape
-        # already includes the storage dim, so strip it back off here).
-        ws2 = ws.reshape(total_ws_blocks * storage, *ws.shape[2:])
-        pool2 = gathered_pool.reshape(self.dcp_size * max_valid * storage, *gathered_pool.shape[2:])
-        dst_flat = dst_token[take].reshape(-1)
-        src_flat = src_token[take].reshape(-1)
-        keep = dst_flat < ws2.shape[0]
-        ws2[dst_flat[keep]] = pool2[src_flat[keep]]
 
-        # Identity block table into the workspace.
-        max_blocks_per_req = int(blocks_per_req.max().item())
+        # Identity block table into the workspace (shape from the host mirror).
         block_cols = torch.arange(max_blocks_per_req, dtype=torch.int64, device=device).unsqueeze(0)
         ws_block_table = (req_block_base[:-1].unsqueeze(1) + block_cols).clamp(min=0)
         ws_block_table = torch.where(
@@ -1649,7 +1716,88 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             ws_block_table,
             torch.zeros_like(ws_block_table),
         ).to(torch.int32)
-        return ws, ws_block_table
+
+        # Step-scoped buffers: allocated once per step (not per layer, and not
+        # per impl -- a per-impl cache would duplicate them across layers).
+        # Every layer overwrites the same rows, so a single zero fill of the
+        # workspace at plan time is enough.
+        local_blocks = torch.empty((max_valid, *block_shape), dtype=compress_kv_cache.dtype, device=device)
+        gathered_pool = torch.empty(
+            (self.dcp_size * max_valid, *block_shape), dtype=compress_kv_cache.dtype, device=device
+        )
+        ws = torch.empty((total_ws_blocks, *block_shape), dtype=compress_kv_cache.dtype, device=device)
+        ws.zero_()
+
+        plan.update(
+            max_cmp=max_cmp,
+            max_valid=max_valid,
+            num_valid=num_valid,
+            valid_block_ids=valid_block_ids,
+            local_blocks=local_blocks,
+            gathered_pool=gathered_pool,
+            ws=ws,
+            ws_block_table=ws_block_table,
+            dst_token=dst_token[take].reshape(-1),
+            src_token=src_token[take].reshape(-1),
+        )
+        context.prefill_plan = plan
+        return plan
+
+    def _gather_prefill_cmp_workspace(
+        self,
+        compress_kv_cache: torch.Tensor,
+        context: AscendDSADCPContext,
+        local_block_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-gather the compressed KV and lay it out in global order.
+
+        The step-invariant plan (block compaction ids, ownership mapping and
+        the identity block table) is built once by
+        :meth:`_prefill_workspace_plan`; this method only moves this layer's
+        compressed KV: compact the referenced blocks, all-gather them into the
+        step-scoped pool, and scatter the owned token rows into the
+        global-order workspace.  Gather outputs are written in place, so no
+        per-layer allocation or memset remains on this path.
+        """
+        num_reqs = context.num_reqs
+        plan = self._prefill_workspace_plan(compress_kv_cache, context, local_block_table)
+        total_ws_blocks = plan["total_ws_blocks"]
+        if total_ws_blocks == 0:
+            return compress_kv_cache, local_block_table[:num_reqs]
+
+        storage = context.storage_block_size
+        block_shape = compress_kv_cache.shape[1:]
+        max_valid = plan["max_valid"]
+        num_valid = plan["num_valid"]
+        valid_block_ids = plan["valid_block_ids"]
+
+        # Segment 2: this layer's compacted blocks, all-gathered in place into
+        # the step-scoped pool (no allocation on this path).
+        local_blocks = plan["local_blocks"]
+        local_blocks[:num_valid] = compress_kv_cache[valid_block_ids.clamp(max=compress_kv_cache.shape[0] - 1)]
+        gathered_pool = plan["gathered_pool"]
+        if self.dcp_size > 1 and self.dcp_device_group is not None:
+            dist.all_gather(
+                list(gathered_pool.view(self.dcp_size, max_valid, *block_shape)),
+                local_blocks,
+                group=self.dcp_device_group,
+            )
+        elif self.dcp_size > 1:
+            gathered_pool[:max_valid].copy_(local_blocks)
+            gathered_pool[max_valid:].zero_()
+        else:
+            gathered_pool.copy_(local_blocks)
+
+        ws = plan["ws"]
+        # Token-granularity views: one row per compressed token (block_shape
+        # already includes the storage dim, so strip it back off here).
+        ws2 = ws.reshape(total_ws_blocks * storage, *ws.shape[2:])
+        pool2 = gathered_pool.reshape(self.dcp_size * max_valid * storage, *gathered_pool.shape[2:])
+        dst_flat = plan["dst_token"]
+        src_flat = plan["src_token"]
+        keep = dst_flat < ws2.shape[0]
+        ws2[dst_flat[keep]] = pool2[src_flat[keep]]
+        return ws, plan["ws_block_table"]
 
     def _dcp_gathered_sinks(self):
         """Attention sinks aligned with the DCP-gathered head dim."""
