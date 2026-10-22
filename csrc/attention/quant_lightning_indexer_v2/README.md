@@ -66,7 +66,8 @@
     - `query`、`key`支持INT8，不支持FLOAT8_e4m3fn、HIFLOAT8和FLOAT4_e2m1。
     - `query_dequant_scale`和`key_dequant_scale`支持FLOAT16，不支持FLOAT32和FLOAT8_e8m0。
     - `weights`支持FLOAT16，不支持FLOAT32。
-    - 不支持`output_idx_offset`和`return_value`。
+    - 不支持`output_idx_offset`。
+    - `return_value=1` 时，先将最终分数按 round-to-nearest-even 舍入到 BF16，再选择 TopK，并返回与索引对应的 BF16 分数；无效位置为 `index=-1`、`score=-inf`。`return_value=0` 保持原有 FP32 分数选择流程。
     - `query`的N仅支持64，`key`的N仅支持1。
     - `topk`支持[1, 2048]。
 

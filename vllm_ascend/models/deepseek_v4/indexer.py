@@ -234,14 +234,18 @@ class AscendIndexerOps:
         key_cache: torch.Tensor,
         scale_cache: torch.Tensor,
         metadata: typing.Any,
-    ) -> torch.Tensor:
+        return_values: bool = False,
+    ):
         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(metadata.qli_metadata))
-        topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
+        prepared_weights = self.device_operator.prepare_dsa_indexer_weights(weights)
+        prepared_query_scale = self.device_operator.prepare_dsa_indexer_query_scale(query_scale)
+        prepared_key_scale = self.device_operator.prepare_dsa_indexer_key_scale(scale_cache)
+        topk_idxs, topk_vals = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
             query=query,
             key=key_cache,
-            weights=self.device_operator.prepare_dsa_indexer_weights(weights),
-            query_dequant_scale=self.device_operator.prepare_dsa_indexer_query_scale(query_scale),
-            key_dequant_scale=self.device_operator.prepare_dsa_indexer_key_scale(scale_cache),
+            weights=prepared_weights,
+            query_dequant_scale=prepared_query_scale,
+            key_dequant_scale=prepared_key_scale,
             topk=self.index_topk,
             quant_mode=self.device_operator.get_dsa_indexer_quant_mode(),
             cu_seqlens_q=metadata.qli_cu_seqlens_q,
@@ -253,8 +257,11 @@ class AscendIndexerOps:
             layout_k="PA_BBND",
             mask_mode=3,
             cmp_ratio=4,
-            return_value=0,
+            return_value=int(return_values),
+            dcp_context=metadata.dcp_causal_context,
         )
+        if return_values:
+            return topk_idxs, topk_vals
         return topk_idxs
 
     def quantize_update_cache_and_select_topk(
@@ -267,7 +274,8 @@ class AscendIndexerOps:
         full_cache: torch.Tensor | None,
         slot_mapping: torch.Tensor,
         metadata: typing.Any,
-    ) -> torch.Tensor:
+        return_values: bool = False,
+    ):
         query, query_scale, _, _ = self.device_operator.indexer_quant_scatter(
             query,
             key,
@@ -283,6 +291,7 @@ class AscendIndexerOps:
             key_cache,
             scale_cache,
             metadata,
+            return_values=return_values,
         )
 
 
@@ -437,12 +446,15 @@ class DeepseekV4Indexer(nn.Module):
         *,
         qr_pertoken_scale: torch.Tensor | None = None,
         write_cache: bool = True,
-    ) -> torch.Tensor:
+        return_topk_values: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         num_tokens = hidden_states.shape[0]
         cache_metadata, _ = self._get_indexer_cache_metadata(metadata)
         cos = cache_metadata.cos[layer_name][:num_tokens]
         sin = cache_metadata.sin[layer_name][:num_tokens]
         aux_stream = overlap_plan.aux_stream
+        if return_topk_values and (self.skip_topk or aux_stream is not None):
+            raise NotImplementedError("return_topk_values is only supported on the serial non-skip_topk path.")
         if self.skip_topk:
             topk_indices = self._get_cached_topk_indices(num_tokens)
         elif aux_stream is not None:
@@ -469,7 +481,7 @@ class DeepseekV4Indexer(nn.Module):
                 ),
             )
         else:
-            topk_indices = self._select_topk_serial(
+            topk_result = self._select_topk_serial(
                 hidden_states,
                 qr,
                 kv_cache,
@@ -478,7 +490,12 @@ class DeepseekV4Indexer(nn.Module):
                 sin,
                 qr_pertoken_scale,
                 write_cache=write_cache,
+                return_values=return_topk_values,
             )
+            if return_topk_values:
+                topk_indices, topk_values = topk_result
+            else:
+                topk_indices = topk_result
 
         if write_cache and (self.skip_topk or aux_stream is None):
             compressed_kv, compress_slot_mapping = overlap_plan.compute_attention_compressed_kv()
@@ -486,6 +503,8 @@ class DeepseekV4Indexer(nn.Module):
 
         if self.use_index_cache:
             self._update_cached_topk_indices(topk_indices)
+        if return_topk_values:
+            return topk_indices, topk_values
         return topk_indices
 
     def _cv_compute_query_and_update_cache_multistream(
@@ -723,6 +742,7 @@ class DeepseekV4Indexer(nn.Module):
         sin: torch.Tensor,
         qr_pertoken_scale: torch.Tensor | None = None,
         write_cache: bool = True,
+        return_values: bool = False,
     ):
         q, kv, ik, isc, ifc, cache_metadata, indexer_slot_mapping = self._indexer_qkv_prepare(
             x,
@@ -747,6 +767,7 @@ class DeepseekV4Indexer(nn.Module):
                 ifc,
                 indexer_slot_mapping,
                 cache_metadata,
+                return_values=return_values,
             )
 
         q, q_scale = self.ops.quantize_query(q)
@@ -757,4 +778,5 @@ class DeepseekV4Indexer(nn.Module):
             ik,
             isc,
             cache_metadata,
+            return_values=return_values,
         )

@@ -208,6 +208,9 @@ ge::graphStatus QLIV2InfoParser::GetNpuInfo()
 
     socVersion_ = ascendcPlatform.GetSocVersion();
     npuArch_ = ascendcPlatform.GetCurNpuArch();
+    // The DCP causal-coordinate path is implemented by the A2/A3 int8 kernel.
+    OP_CHECK_IF(context_->GetOptionalInputShape(DCP_CONTEXT_INPUT_INDEX) != nullptr && npuArch_ != NpuArch::DAV_2201,
+                OP_LOGE(opName_, "dcp_context requires the DAV_2201 indexer kernel."), return GRAPH_FAILED);
     if ((npuArch_ != NpuArch::DAV_2201) && (npuArch_ != NpuArch::DAV_3510)) {
         OP_LOGE(opName_, "NpuArch[%d] is not support.", static_cast<int32_t>(npuArch_));
         return GRAPH_FAILED;
@@ -408,16 +411,11 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
                     return ge::GRAPH_FAILED);
     }
 
-    if (npuArch_ == NpuArch::DAV_2201) {
-        OP_CHECK_IF(*opParamInfo_.returnValue, OP_LOGE(opName_, "input attr returnValue only supported False."),
-                    return ge::GRAPH_FAILED);
-    } else if (npuArch_ == NpuArch::DAV_3510) {
-        OP_CHECK_IF((*opParamInfo_.returnValue != 0) && (*opParamInfo_.returnValue != 1),
-                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "return_value",
-                                                          std::to_string(*opParamInfo_.returnValue).c_str(),
-                                                          "Return_value only supports 0 or 1"),
-                    return ge::GRAPH_FAILED);
-    }
+    OP_CHECK_IF((*opParamInfo_.returnValue != 0) && (*opParamInfo_.returnValue != 1),
+                OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "return_value",
+                                                      std::to_string(*opParamInfo_.returnValue).c_str(),
+                                                      "Return_value only supports 0 or 1"),
+                return ge::GRAPH_FAILED);
     OP_CHECK_IF(
         (*opParamInfo_.maxSeqlenQ < -1),
         OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "max_seqlen_q", std::to_string(*opParamInfo_.maxSeqlenQ).c_str(),
@@ -849,7 +847,7 @@ ge::graphStatus QLIV2InfoParser::CheckShapeDim()
                                          std::to_string(expectShapeDim - 1).c_str()),
             return ge::GRAPH_FAILED);
     }
-    if (npuArch_ == NpuArch::DAV_3510 && *opParamInfo_.returnValue == 1) {
+    if (*opParamInfo_.returnValue == 1) {
         uint32_t sparseValuesShapeDim = opParamInfo_.sparseValues.shape->GetStorageShape().GetDimNum();
         OP_CHECK_IF(sparseValuesShapeDim != expectShapeDim,
                     OP_LOGE_FOR_INVALID_SHAPEDIM(opName_, "sparse_values", std::to_string(sparseValuesShapeDim).c_str(),

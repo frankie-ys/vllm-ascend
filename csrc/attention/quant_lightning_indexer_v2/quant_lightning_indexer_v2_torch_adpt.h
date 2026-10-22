@@ -27,7 +27,8 @@ at::Tensor QuantLightningIndexerMetadata(int64_t numHeadsQ, int64_t numHeadsK, i
                                          const c10::optional<at::Tensor> &sequsedK,
                                          const c10::optional<at::Tensor> &cmpResidualK, int64_t batchSize,
                                          int64_t maxSeqlenQ, int64_t maxSeqlenK, c10::string_view layoutQ,
-                                         c10::string_view layoutK, int64_t maskMode, int64_t cmpRatio)
+                                         c10::string_view layoutK, int64_t maskMode, int64_t cmpRatio,
+                                         const c10::optional<at::Tensor> &dcpContext = c10::nullopt)
 {
     at::Device outputDevice = at::Device(std::string("npu"));
     if (cuSeqlensQ.has_value()) {
@@ -48,6 +49,7 @@ at::Tensor QuantLightningIndexerMetadata(int64_t numHeadsQ, int64_t numHeadsK, i
     auto sequsedQVal = valid_tensor(sequsedQ, outputDevice);
     auto sequsedKVal = valid_tensor(sequsedK, outputDevice);
     auto cmpResidualKVal = valid_tensor(cmpResidualK, outputDevice);
+    auto dcpContextVal = valid_tensor(dcpContext, outputDevice);
 
     std::string layoutQStr = std::string(layoutQ);
     std::string layoutKStr = std::string(layoutK);
@@ -56,7 +58,7 @@ at::Tensor QuantLightningIndexerMetadata(int64_t numHeadsQ, int64_t numHeadsK, i
 
     if (output.device().is_meta()) return output;
     EXEC_NPU_CMD(aclnnVllmAscendQuantLightningIndexerV2Metadata, cuSeqlensQVal, cuSeqlensKVal, sequsedQVal, sequsedKVal,
-              cmpResidualKVal, numHeadsQ, numHeadsK, headDim, topk, quantMode, batchSize, maxSeqlenQ, maxSeqlenK,
+              cmpResidualKVal, dcpContextVal, numHeadsQ, numHeadsK, headDim, topk, quantMode, batchSize, maxSeqlenQ, maxSeqlenK,
               layoutQPtr, layoutKPtr, maskMode, cmpRatio, output);
     return output;
 }
@@ -98,7 +100,7 @@ std::tuple<at::Tensor, at::Tensor> ConstructQuantLightningIndexerOutputTensor(
     return std::tuple<at::Tensor, at::Tensor>(sparseIndicesOut, sparseValuesOut);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidateImpl(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights, const at::Tensor &queryDequantScale,
     const at::Tensor &keyDequantScale, int64_t topk, int64_t quantMode,
     const c10::optional<at::Tensor> &candidateTopkIndexIn, const c10::optional<at::Tensor> &cuSeqlensQ,
@@ -107,7 +109,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
     const c10::optional<at::Tensor> &blockTable, const c10::optional<at::Tensor> &outputIdxOffset,
     const c10::optional<at::Tensor> &metadata, int64_t maxSeqlenQ, c10::string_view layoutQ,
     c10::string_view layoutK, int64_t maskMode, int64_t cmpRatio, int64_t candidateMode,
-    int64_t candidateTopkBlocks, int64_t candidateBlockSize)
+    int64_t candidateTopkBlocks, int64_t candidateBlockSize,
+    const c10::optional<at::Tensor> &dcpContext, int64_t returnValue)
 {
     TORCH_CHECK(query.numel() > 0, "Tensor query is empty.")
     TORCH_CHECK(key.numel() > 0, "Tensor key is empty.")
@@ -116,7 +119,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
     std::string keyLayoutStr = std::string(layoutK);
 
     std::tuple<at::Tensor, at::Tensor> quantLightningIndexerOutput =
-        ConstructQuantLightningIndexerOutputTensor(query, key, topk, queryLayoutStr, keyLayoutStr, 0);
+        ConstructQuantLightningIndexerOutputTensor(query, key, topk, queryLayoutStr, keyLayoutStr, returnValue);
     at::Tensor sparseIndicesOut = std::get<0>(quantLightningIndexerOutput);
     at::Tensor sparseValuesOut = std::get<1>(quantLightningIndexerOutput);
 
@@ -136,7 +139,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
 
     char *queryLayoutPtr = const_cast<char *>(queryLayoutStr.c_str());
     char *keyLayoutPtr = const_cast<char *>(keyLayoutStr.c_str());
-    int64_t returnValue = 0;
 
     TORCH_CHECK(candidateMode >= 1 && candidateMode <= 3, "Invalid candidate_mode");
     TORCH_CHECK(candidateMode != 2 || candidateTopkIndexIn.has_value(), "Consumer requires candidate blocks");
@@ -149,11 +151,30 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
 
     EXEC_NPU_CMD(aclnnVllmAscendQuantLightningIndexerV2, query, key, weights, queryDequantScale, keyDequantScale,
               cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK, blockTable, outputIdxOffset,
-              metadata, candidateTopkIndexIn, topk, quantMode, maxSeqlenQ, queryLayoutPtr, keyLayoutPtr, maskMode,
+              metadata, candidateTopkIndexIn, dcpContext, topk, quantMode, maxSeqlenQ, queryLayoutPtr, keyLayoutPtr, maskMode,
               cmpRatio, returnValue, candidateMode, candidateTopkBlocks, candidateBlockSize, keyStride0,
               keyScaleStride0, sparseIndicesOut, sparseValuesOut, candidateTopkIndexOut);
 
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(sparseIndicesOut, sparseValuesOut, candidateTopkIndexOut);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
+    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights, const at::Tensor &queryDequantScale,
+    const at::Tensor &keyDequantScale, int64_t topk, int64_t quantMode,
+    const c10::optional<at::Tensor> &candidateTopkIndexIn, const c10::optional<at::Tensor> &cuSeqlensQ,
+    const c10::optional<at::Tensor> &cuSeqlensK, const c10::optional<at::Tensor> &sequsedQ,
+    const c10::optional<at::Tensor> &sequsedK, const c10::optional<at::Tensor> &cmpResidualK,
+    const c10::optional<at::Tensor> &blockTable, const c10::optional<at::Tensor> &outputIdxOffset,
+    const c10::optional<at::Tensor> &metadata, int64_t maxSeqlenQ, c10::string_view layoutQ,
+    c10::string_view layoutK, int64_t maskMode, int64_t cmpRatio, int64_t candidateMode,
+    int64_t candidateTopkBlocks, int64_t candidateBlockSize,
+    const c10::optional<at::Tensor> &dcpContext)
+{
+    return QuantLightningIndexerCandidateImpl(
+        query, key, weights, queryDequantScale, keyDequantScale, topk, quantMode,
+        candidateTopkIndexIn, cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK,
+        blockTable, outputIdxOffset, metadata, maxSeqlenQ, layoutQ, layoutK, maskMode,
+        cmpRatio, candidateMode, candidateTopkBlocks, candidateBlockSize, dcpContext, 0);
 }
 
 }  // namespace vllm_ascend::qli_v2

@@ -122,6 +122,7 @@ static ge::graphStatus InferDataTypeQuantLightningIndexerV2(gert::InferDataTypeC
     // default index data type is int32
     ge::DataType outputType = ge::DT_INT32;
     context->SetOutputDataType(0, outputType);
+    context->SetOutputDataType(1, ge::DT_BF16);
     context->SetOutputDataType(CANDIDATE_TOPK_INDEX_OUTPUT_INDEX, outputType);
     OP_LOGD(context->GetNodeName(), "QuantLightningIndexerV2 InferDataType end.");
     return GRAPH_SUCCESS;

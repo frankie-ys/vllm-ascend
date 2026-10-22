@@ -63,11 +63,18 @@ TEST_F(QuantLightningIndexerV2TilingArch22, QuantLightningIndexerV2_910b_tiling_
     qliv2_ut::RunTilingCase(p, ge::GRAPH_FAILED);
 }
 
-// return_value only supports false on Ascend910B
-TEST_F(QuantLightningIndexerV2TilingArch22, QuantLightningIndexerV2_910b_tiling_return_value_failed)
+TEST_F(QuantLightningIndexerV2TilingArch22, QuantLightningIndexerV2_910b_tiling_return_bf16_values)
 {
     qliv2_ut::CaseParam p;
     p.returnValue = 1;
+    p.valuesShape = p.outShape;
+    qliv2_ut::RunTilingCase(p, ge::GRAPH_SUCCESS);
+}
+
+TEST_F(QuantLightningIndexerV2TilingArch22, QuantLightningIndexerV2_910b_tiling_return_value_failed)
+{
+    qliv2_ut::CaseParam p;
+    p.returnValue = 2;
     qliv2_ut::RunTilingCase(p, ge::GRAPH_FAILED);
 }
 

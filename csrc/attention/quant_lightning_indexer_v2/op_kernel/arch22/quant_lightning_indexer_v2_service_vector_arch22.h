@@ -21,6 +21,7 @@
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
 #include "quant_lightning_indexer_v2_common_arch22.h"
+#include "../../../common/dcp_causal.h"
 #include "quant_lightning_indexer_v2_vector.h"
 
 namespace QLIV2Kernel {
@@ -58,6 +59,7 @@ public:
                                                   bool outputIdxOffsetValid);
     __aicore__ inline void InitVecInputTensor(GlobalTensor<half> weightsGm, GlobalTensor<half> qScaleGm,
                                               GlobalTensor<half> kScaleGm, GlobalTensor<int32_t> indiceOutGm,
+                                              GlobalTensor<bfloat16_t> valueOutGm,
                                               GlobalTensor<int32_t> blockTableGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline int32_t AlignS2(int32_t cuS2Len);
@@ -73,12 +75,15 @@ protected:
     GlobalTensor<half> kScaleGm;
     GlobalTensor<half> vec0OutGm;
     GlobalTensor<int32_t> indiceOutGm;
+    GlobalTensor<bfloat16_t> valueOutGm;
     GlobalTensor<int32_t> candidateTopkIndexInGm;
     GlobalTensor<int32_t> candidateTopkIndexOutGm;
     GlobalTensor<int32_t> blockTableGm;
     // =================================常量区=================================
 
 private:
+    __aicore__ inline void CopyOutValues(const LocalTensor<float> &values,
+                                        const LocalTensor<bfloat16_t> &valuesBf16, int64_t outputOffset);
     __aicore__ inline void GetKeyScale(const QLIV2Common::RunInfo &runInfo, const LocalTensor<half> &resUb,
                                        int64_t batchId, int64_t startS2, int64_t getLen);
     // candidate (two-level topk)
@@ -281,12 +286,14 @@ template <typename QLIV2T>
 __aicore__ inline void QLIV2Vector<QLIV2T>::InitVecInputTensor(GlobalTensor<half> weightsGm,
                                                                GlobalTensor<half> qScaleGm, GlobalTensor<half> kScaleGm,
                                                                GlobalTensor<int32_t> indiceOutGm,
+                                                               GlobalTensor<bfloat16_t> valueOutGm,
                                                                GlobalTensor<int32_t> blockTableGm)
 {
     this->weightsGm = weightsGm;
     this->qScaleGm = qScaleGm;
     this->kScaleGm = kScaleGm;
     this->indiceOutGm = indiceOutGm;
+    this->valueOutGm = valueOutGm;
     this->blockTableGm = blockTableGm;
 }
 
@@ -321,6 +328,17 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::FreeEventID()
 {}
 
 template <typename QLIV2T>
+__aicore__ inline void QLIV2Vector<QLIV2T>::CopyOutValues(
+    const LocalTensor<float> &values, const LocalTensor<bfloat16_t> &valuesBf16, int64_t outputOffset)
+{
+    Cast(valuesBf16, values, RoundMode::CAST_RINT, constInfo_.sparseCount);
+    PipeBarrier<PIPE_V>();
+    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+    QLIV2ServiceVec::CopyOut(valueOutGm[outputOffset], valuesBf16, constInfo_.sparseCount);
+    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+}
+
+template <typename QLIV2T>
 __aicore__ inline void QLIV2Vector<QLIV2T>::CleanInvalidOutput(int64_t invalidS1offset)
 {
     // init -1 and copy to output
@@ -331,6 +349,13 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::CleanInvalidOutput(int64_t invalidS1
     valueULocal = outQueue_.DeQue<float>();
     QLIV2ServiceVec::CopyOut(indiceOutGm[invalidS1offset], idxULocal1, constInfo_.sparseCount);
     outQueue_.FreeTensor(valueULocal);
+    if (constInfo_.returnValue) {
+        LocalTensor<float> invalidValues = tmpBuf_.Get<float>();
+        Duplicate(invalidValues.template ReinterpretCast<int32_t>(), QLIV2ServiceVec::NEG_INF,
+                  constInfo_.sparseCount);
+        PipeBarrier<PIPE_V>();
+        CopyOutValues(invalidValues, tmpBuf_.Get<bfloat16_t>()[BASE_TOPK * 2], invalidS1offset);
+    }
     // mode=1: candidate_topk_index 同步填 -1 (行偏移 = sparse 偏移 / sparseCount * candidateTopkBlocks)
     if (constInfo_.candidateMode == CANDIDATE_MODE_SOURCE) {
         uint64_t candOffset = static_cast<uint64_t>(invalidS1offset) / constInfo_.sparseCount *
@@ -815,7 +840,14 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
     for (int innerS1Idx = 0; innerS1Idx < cuS1ProcNumPerAiv; innerS1Idx++) {
         if (constInfo_.attenMaskFlag) {
             cuRealAcSeqCount += 1;
-            cuRealAcSeq = (cuRealAcSeqCount + cuRealAcSeqIni) / static_cast<int32_t>(constInfo_.cmpRatio);
+            if (constInfo_.dcpSize > 1) {
+                const int64_t rawEnd = static_cast<int64_t>(info.globalSeqLen) - info.actS1Size +
+                    cuS1BeginIdxPerAiv + innerS1Idx + 1;
+                cuRealAcSeq = vllm_ascend::dcp::LocalCompressedLength(
+                    rawEnd, constInfo_.cmpRatio, constInfo_.dcpSize, constInfo_.dcpRank, constInfo_.dcpInterleave);
+            } else {
+                cuRealAcSeq = (cuRealAcSeqCount + cuRealAcSeqIni) / static_cast<int32_t>(constInfo_.cmpRatio);
+            }
         }
         int32_t cuS2Len = cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq ? cuRealAcSeq - cuBaseS2Idx : s2BaseSize_;
         int32_t cuS1Idx = cuS1BeginIdxPerAiv + innerS1Idx;
@@ -843,6 +875,15 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             PipeBarrier<PIPE_V>();
             AscendC::Mul(mmInUb, mmInUb, kScaleUb, cuS2Len);
             PipeBarrier<PIPE_V>();
+            if (constInfo_.returnValue) {
+                // Select and communicate the same BF16-rounded scores. The
+                // existing float sort buffers hold their exact widened values.
+                LocalTensor<bfloat16_t> scoreBf16 = kScaleUb.template ReinterpretCast<bfloat16_t>();
+                Cast(scoreBf16, mmInUb, RoundMode::CAST_RINT, cuS2Len);
+                PipeBarrier<PIPE_V>();
+                Cast(mmInUb, scoreBf16, RoundMode::CAST_NONE, cuS2Len);
+                PipeBarrier<PIPE_V>();
+            }
             // mode=2 (use_candidate, R11 leak): 候选块外 score 降级 NEG_HUGE (S4a, 纯算术无 NaN);
             // 仅降级排序资格、不取消入选资格 — 不足 topk 时候选外可达位置作为填充泄漏 (§1.6)
             if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER) {
@@ -892,9 +933,15 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             // 中间结果保存
             if (needCopyOutGm && !info.isNeedLD) {
                 LocalTensor<uint32_t> idxULocal = outQueue_.AllocTensor<uint32_t>();
-                ExtractIndex(idxULocal,
-                             globalTopkUb_[innerS1Idx * BASE_TOPK_VALUE_IDX_SIZE].template ReinterpretCast<uint32_t>(),
-                             BASE_TOPK);
+                LocalTensor<float> selectedValues = tmpBuf_.Get<float>();
+                if (constInfo_.returnValue) {
+                    Extract(selectedValues, idxULocal,
+                            globalTopkUb_[innerS1Idx * BASE_TOPK_VALUE_IDX_SIZE], BASE_TOPK / ELE_NUM_32);
+                } else {
+                    ExtractIndex(idxULocal,
+                                 globalTopkUb_[innerS1Idx * BASE_TOPK_VALUE_IDX_SIZE].template ReinterpretCast<uint32_t>(),
+                                 BASE_TOPK);
+                }
                 PipeBarrier<PIPE_V>();
                 // A15: output_idx_offset — 输出拷 GM 前逐元素加行偏移 (对齐 arch35 IndicesAddOffset;
                 // 零偏移零开销; GM 标量读无 V_S 竞态; int32 整数域 Adds 位精确, -1 槽 +0 不变。
@@ -916,6 +963,10 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
                 QLIV2ServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount],
                                          idxULocal.template ReinterpretCast<int32_t>(), constInfo_.sparseCount);
                 outQueue_.FreeTensor(idxULocal);
+                if (constInfo_.returnValue) {
+                    CopyOutValues(selectedValues, tmpBuf_.Get<bfloat16_t>()[BASE_TOPK * 2],
+                                  info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount);
+                }
                 // mode=1: 块级 topk 直出 candidate_topk_index
                 if (constInfo_.candidateMode == CANDIDATE_MODE_SOURCE) {
                     CopyOutCandTopkIndex(info, cuS1Idx, innerS1Idx);
@@ -974,7 +1025,8 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             }
         }
 
-        int32_t invalidS1Num2 = info.actS1Size - info.actS2SizeOrig;
+        const int32_t rawSeqLen = constInfo_.dcpSize > 1 ? info.globalSeqLen : info.actS2SizeOrig;
+        int32_t invalidS1Num2 = static_cast<int32_t>(info.actS1Size) - rawSeqLen;
         if (invalidS1Num2 > 0 && isS1LoopEnd && blockS2StartIdx_ == 0 && constInfo_.attenMaskFlag) {
             int32_t s1NumPerAiv = blockId_ % 2 == 0 ? CeilDiv(invalidS1Num2, 2) : (invalidS1Num2 / 2);
             int32_t s1OffsetPerAiv = (blockId_ % 2) * CeilDiv(invalidS1Num2, 2);
@@ -1121,6 +1173,9 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
             ldInfo_.indiceOutCoreOffset + (ldInfo_.mStart + j) * constInfo_.kHeadNum * constInfo_.sparseCount;
         AscendC::DataCopyPad(indiceOutGm[outOffset], idxULocal1, copyOutParams);
         SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+        if (constInfo_.returnValue) {
+            CopyOutValues(outValueUb, ldTmpBuf_.Get<bfloat16_t>(), outOffset);
+        }
     }
     SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
 }
