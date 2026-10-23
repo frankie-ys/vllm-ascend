@@ -998,6 +998,13 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
     # actually matters.
     can_return_lse_for_decode = True
     need_to_return_lse_for_decode = True
+    # MTP / speculative decode under DCP with interleave > 1: the causal
+    # horizon is derived per query from the dcp_context buffer
+    # (``rawEnd = seq_len - actS1 + q_offset + 1``) in every kernel that
+    # consumes it -- QLI metadata, QLI execution, sparse-attn metadata and
+    # the SWA kernel -- so multi-token draft blocks get their own correct
+    # local compressed view instead of the request-level bound.
+    supports_mtp_with_cp_non_trivial_interleave_size = True
 
     def _get_dcp_context(self, layer_metadata) -> AscendDSADCPContext | None:
         metadata = layer_metadata.attention
@@ -1391,7 +1398,14 @@ class AscendDSADCPImpl(DCPImplMixin, AscendDSAImpl):
             layout_kv=_dsa_layout_kv(self.vllm_config),
             return_softmax_lse=True,
         )
-        # The SWA-only pass consumes the second (merge-only) metadata buffer.
+        # The SWA-only pass must reproduce the SAME original-KV term the fused
+        # pass contributed, otherwise the exp-space subtraction below removes
+        # the wrong (dcp_size - 1) copies.  DSpark draft blocks restrict the
+        # original KV to an explicit shared visible set, so the correction
+        # pass needs those indices too -- without them it would attend the
+        # per-query causal window and the merge would corrupt the output.
+        if swa_req_metadata.dspark_swa_indices is not None:
+            swa_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices
         # Both buffers are refreshed by ATTENTION-stage tasks and are keyed by
         # buffer identity, so this pass needs its own wait.
         if context.swa_only_sas_metadata is not None:
